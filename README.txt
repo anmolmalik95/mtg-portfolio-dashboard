@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/banner.png" alt="MTG Portfolio Dashboard banner" width="100%">
-</p>
-
 # Magic: The Gathering Portfolio Dashboard
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-red)
