@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Streamlit
+.streamlit/
+
+# Local data (DON'T COMMIT)
+data/collection.csv
+data/mtg_prices.sqlite
+data/cache/
+
+# OS/editor
+.DS_Store
+.vscode/
