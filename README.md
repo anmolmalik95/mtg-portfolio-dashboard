@@ -12,7 +12,6 @@
 ### Live Demo  
 👉 [Explore the dashboard here](https://mtg-portfolio-dashboard.streamlit.app)
 
----
 
 ## 1. Introduction
 Magic: The Gathering cards behave a lot like financial assets.
@@ -155,11 +154,3 @@ The emphasis is on data integrity, structure, and clarity over novelty.
 - Extend snapshot granularity controls
 - Replace Scryfall with a pluggable pricing backend
 - Adapt ingestion for traditional financial markets
-
----
-
-## 12. Credits
-- Scryfall API for card data and pricing
-- Streamlit for the dashboard framework
-- SQLite for embedded storage
-- Every Commander deck that taught me the value of tracking my collection
