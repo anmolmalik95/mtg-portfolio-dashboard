@@ -3,7 +3,7 @@
 </p>
 
 # Magic: The Gathering Portfolio Dashboard
-![Python](https://img.shields.io/badge/Python-3.12-blue)
+![Python](https://img.shields.io/badge/Python-3.14-blue)
 ![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-red)
 ![SQLite](https://img.shields.io/badge/SQLite-Embedded-lightgrey)
 ![Data](https://img.shields.io/badge/Data-Scryfall%20API-purple)
