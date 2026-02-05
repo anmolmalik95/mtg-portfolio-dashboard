@@ -4,7 +4,6 @@ import altair as alt
 from typing import Any, cast
 
 import os
-from scripts.dashboard_data import get_dashboard_data
 
 import streamlit as st
 st.write("DB_URL_SET:", bool(os.getenv("DATABASE_URL")))
