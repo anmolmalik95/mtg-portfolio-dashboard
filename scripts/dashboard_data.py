@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -29,17 +30,12 @@ def _get_engine() -> Engine:
 
     db_url = os.getenv("DATABASE_URL")
     if db_url:
-        # Important for Supabase: prefer a stable pool + pre-ping.
-        return create_engine(db_url, pool_pre_ping=True, pool_size=5, max_overflow=5)
+        return create_engine(db_url, pool_pre_ping=True)
 
     return create_engine(f"sqlite:///{db_path.as_posix()}", pool_pre_ping=True)
 
 
 def _ensure_schema(engine: Engine) -> None:
-    """
-    Ensure price_snapshots exists. Safe to run every startup.
-    Matches your existing SQLite schema exactly (types adapted for Postgres).
-    """
     ddl = """
     create table if not exists price_snapshots (
         snapshot_date text not null,
@@ -60,22 +56,32 @@ def _ensure_schema(engine: Engine) -> None:
 
 
 # -------------------------
-# Snapshot helpers (robust for Postgres/Supabase)
+# Snapshot helpers
 # -------------------------
 def _latest_snapshot_date(engine: Engine) -> str:
-    with engine.begin() as conn:
-        val = conn.execute(text("select max(snapshot_date) from price_snapshots;")).scalar()
-    if not val:
+    df = pd.read_sql_query(
+        text("SELECT MAX(snapshot_date) AS max_date FROM price_snapshots;"),
+        engine,
+    )
+    latest = df.iloc[0]["max_date"] if not df.empty else None
+    if not latest:
         raise RuntimeError("No snapshots found. Run scripts/snapshot_prices.py first.")
-    return str(val)
+    return str(latest)
 
 
 def _snapshot_on_or_before(engine: Engine, target_date: str) -> str | None:
-    with engine.begin() as conn:
-        val = conn.execute(
-            text("select max(snapshot_date) from price_snapshots where snapshot_date <= :d;"),
-            {"d": target_date},
-        ).scalar()
+    df = pd.read_sql_query(
+        text(
+            """
+            SELECT MAX(snapshot_date) AS max_date
+            FROM price_snapshots
+            WHERE snapshot_date <= :target_date;
+            """
+        ),
+        engine,
+        params={"target_date": target_date},
+    )
+    val = df.iloc[0]["max_date"] if not df.empty else None
     return str(val) if val else None
 
 
@@ -87,14 +93,8 @@ def _compute_live_owned(
     cache_dir: Path,
     ttl_hours: int = CACHE_TTL_HOURS,
 ) -> pd.DataFrame:
-    """
-    owned: columns = set_code, collector_number, finish, qty
-    Returns DataFrame with live-enriched columns:
-      scryfall_id, name, rarity, type_line, usd, position_value_usd
-    Uses disk cache for Scryfall payloads; does NOT touch DB.
-    """
     unique = owned[["set_code", "collector_number"]].drop_duplicates()
-    card_cache: dict[PrintingKey, dict] = {}
+    card_cache: dict[PrintingKey, dict[str, Any]] = {}
 
     for _, r in unique.iterrows():
         key = PrintingKey(str(r["set_code"]), str(r["collector_number"]))
@@ -133,14 +133,6 @@ def _compute_live_owned(
 # Public API for Streamlit
 # -------------------------
 def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) -> dict[str, object]:
-    """
-    Returns a dict of DataFrames and metadata used by the Streamlit dashboard.
-
-    days: lookback window for movers (uses latest snapshot date as 'today' for baseline selection)
-    live_prices:
-      - True  => totals/holdings/breakdowns computed using live Scryfall prices (cached), no persistence
-      - False => totals/holdings/breakdowns computed from latest snapshot table
-    """
     root = Path(__file__).resolve().parents[1]
     csv_path = root / "data" / "collection.csv"
     cache_dir = root / "data" / "cache" / "scryfall"
@@ -160,37 +152,29 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
     baseline: str | None = None
     baseline_rows = pd.DataFrame()
 
-    # A) Get latest snapshot (do NOT let baseline errors overwrite it)
     try:
         latest = _latest_snapshot_date(engine)
-    except Exception as e:
-        print(f"[latest snapshot lookup failed] {type(e).__name__}: {e}")
-        latest = None
+        target = (date.fromisoformat(latest) - timedelta(days=days)).isoformat()
+        baseline = _snapshot_on_or_before(engine, target)
 
-    # B) Try baseline lookup only if latest exists
-    if latest is not None:
-        try:
-            target = (date.fromisoformat(latest) - timedelta(days=days)).isoformat()
-            baseline = _snapshot_on_or_before(engine, target)
-
-            if baseline is not None:
-                baseline_rows = pd.read_sql_query(
+        if baseline is not None:
+            baseline_rows = pd.read_sql_query(
+                text(
                     """
                     SELECT scryfall_id, finish, usd AS usd_baseline
                     FROM price_snapshots
                     WHERE snapshot_date = :baseline;
-                    """,
-                    engine,
-                    params={"baseline": baseline},
-                )
-        except Exception as e:
-            print(f"[baseline snapshot lookup failed] {type(e).__name__}: {e}")
-            baseline = None
-            baseline_rows = pd.DataFrame()
+                    """
+                ),
+                engine,
+                params={"baseline": baseline},
+            )
+    except Exception as e:
+        print(f"[snapshot lookup failed] {type(e).__name__}: {e}")
+        latest = None
+        baseline = None
+        baseline_rows = pd.DataFrame()
 
-    # -------------------------
-    # Holdings source: live vs snapshot
-    # -------------------------
     pricing_mode = "live" if live_prices else "snapshot"
     pricing_asof = date.today().isoformat() if live_prices else (latest or "N/A")
 
@@ -203,23 +187,20 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
             )
 
         latest_rows = pd.read_sql_query(
-            """
-            SELECT set_code, collector_number, finish, scryfall_id, name, rarity, type_line, usd
-            FROM price_snapshots
-            WHERE snapshot_date = :latest;
-            """,
+            text(
+                """
+                SELECT set_code, collector_number, finish, scryfall_id, name, rarity, type_line, usd
+                FROM price_snapshots
+                WHERE snapshot_date = :latest;
+                """
+            ),
             engine,
             params={"latest": latest},
         )
 
-        latest_owned = owned.merge(
-            latest_rows, on=["set_code", "collector_number", "finish"], how="inner"
-        )
+        latest_owned = owned.merge(latest_rows, on=["set_code", "collector_number", "finish"], how="inner")
         latest_owned["position_value_usd"] = latest_owned["usd"] * latest_owned["qty"]
 
-    # -------------------------
-    # Top holdings / totals
-    # -------------------------
     top_holdings = (
         latest_owned.dropna(subset=["usd"])
         .sort_values("position_value_usd", ascending=False)
@@ -230,9 +211,6 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
     total_value = float(latest_owned["position_value_usd"].sum(skipna=True))
     num_positions = int(latest_owned.shape[0])
 
-    # -------------------------
-    # Rarity breakdown
-    # -------------------------
     rarity_breakdown = (
         latest_owned.groupby("rarity", dropna=False)
         .agg(count=("qty", "sum"), value_usd=("position_value_usd", "sum"))
@@ -240,9 +218,6 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
         .reset_index()
     )
 
-    # -------------------------
-    # Type buckets breakdown
-    # -------------------------
     def type_buckets(type_line: str) -> list[str]:
         if not type_line:
             return ["Unknown"]
@@ -261,9 +236,6 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
         .reset_index()
     )
 
-    # -------------------------
-    # Movers: compare current (live or latest snapshot) vs baseline snapshot
-    # -------------------------
     gainers = pd.DataFrame()
     losers = pd.DataFrame()
 
@@ -273,9 +245,7 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
 
         movers["delta_usd"] = movers["usd"] - movers["usd_baseline"]
         movers["pct_change"] = movers.apply(
-            lambda r: (r["delta_usd"] / r["usd_baseline"]) * 100.0
-            if r["usd_baseline"] not in (0, None)
-            else None,
+            lambda r: (r["delta_usd"] / r["usd_baseline"]) * 100.0 if r["usd_baseline"] not in (0, None) else None,
             axis=1,
         )
 
@@ -301,11 +271,6 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
 
 
 def get_portfolio_timeseries() -> pd.DataFrame:
-    """
-    Returns DataFrame with columns:
-      snapshot_date (YYYY-MM-DD), total_value_usd
-    Computed from price_snapshots joined with current holdings (collection.csv).
-    """
     root = Path(__file__).resolve().parents[1]
     csv_path = root / "data" / "collection.csv"
 
@@ -321,19 +286,17 @@ def get_portfolio_timeseries() -> pd.DataFrame:
     _ensure_schema(engine)
 
     snaps = pd.read_sql_query(
-        """
-        SELECT snapshot_date, set_code, collector_number, finish, usd
-        FROM price_snapshots
-        WHERE usd IS NOT NULL;
-        """,
+        text(
+            """
+            SELECT snapshot_date, set_code, collector_number, finish, usd
+            FROM price_snapshots
+            WHERE usd IS NOT NULL;
+            """
+        ),
         engine,
     )
 
-    merged = owned.merge(
-        snaps,
-        on=["set_code", "collector_number", "finish"],
-        how="inner",
-    )
+    merged = owned.merge(snaps, on=["set_code", "collector_number", "finish"], how="inner")
     merged["position_value_usd"] = merged["usd"] * merged["qty"]
 
     ts = (
@@ -343,11 +306,3 @@ def get_portfolio_timeseries() -> pd.DataFrame:
         .reset_index(drop=True)
     )
     return ts
-
-
-if __name__ == "__main__":
-    data = get_dashboard_data(days=1, top_n=5, live_prices=True)
-    print("Pricing mode:", data["pricing_mode"], "asof:", data["pricing_asof"])
-    print("Latest snapshot:", data["latest_snapshot"])
-    print("Baseline snapshot:", data["baseline_snapshot"])
-    print("Total value:", data["total_value_usd"])
