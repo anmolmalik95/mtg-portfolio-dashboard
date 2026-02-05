@@ -49,10 +49,48 @@ def load_collection(csv_path: Path) -> pd.DataFrame:
     return df
 
 def fetch_scryfall_card(set_code: str, collector_number: str) -> Dict[str, Any]:
+    """
+    Fetch a Scryfall card payload.
+
+    Important for Streamlit Cloud:
+    - Cold starts can burst many requests, hitting Scryfall rate limits (429).
+    - We retry with backoff.
+    - If we still can't fetch, we return a minimal stub so the app doesn't crash.
+    """
     url = f"{SCRYFALL_API}/cards/{set_code}/{collector_number}"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return r.json()
+
+    # Retry budget: ~ (1 + 2 + 4 + 8) seconds = 15s plus request timeouts
+    backoffs = [1.0, 2.0, 4.0, 8.0]
+
+    last_status: int | None = None
+    for i, wait_s in enumerate([0.0] + backoffs):
+        if wait_s:
+            time.sleep(wait_s)
+
+        try:
+            r = requests.get(url, timeout=20)
+            last_status = r.status_code
+
+            if r.status_code == 429:
+                # Rate limited; retry with backoff
+                continue
+
+            r.raise_for_status()
+            return r.json()
+
+        except requests.RequestException:
+            # Network hiccup etc; retry
+            continue
+
+    # Fallback: minimal stub to keep pipeline alive.
+    # Price functions will see missing fields and yield None USD.
+    return {
+        "id": f"unfetched:{set_code}:{collector_number}",
+        "name": f"{set_code.upper()} #{collector_number}",
+        "rarity": "unknown",
+        "type_line": "",
+        "prices": {},
+    }
 
 def _cache_filename(key: PrintingKey) -> str:
     safe_cn = key.collector_number.replace("/", "_").replace("\\", "_").replace(" ", "")

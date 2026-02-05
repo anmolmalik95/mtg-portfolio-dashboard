@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import os
-import time
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -31,9 +29,9 @@ def _get_engine() -> Engine:
 
     db_url = os.getenv("DATABASE_URL")
     if db_url:
-        return create_engine(db_url, pool_pre_ping=True)
+        # Important for Supabase: prefer a stable pool + pre-ping.
+        return create_engine(db_url, pool_pre_ping=True, pool_size=5, max_overflow=5)
 
-    # Local dev fallback
     return create_engine(f"sqlite:///{db_path.as_posix()}", pool_pre_ping=True)
 
 
@@ -62,27 +60,22 @@ def _ensure_schema(engine: Engine) -> None:
 
 
 # -------------------------
-# Snapshot helpers
+# Snapshot helpers (robust for Postgres/Supabase)
 # -------------------------
 def _latest_snapshot_date(engine: Engine) -> str:
-    df = pd.read_sql_query("SELECT MAX(snapshot_date) AS max_date FROM price_snapshots;", engine)
-    latest = df.iloc[0]["max_date"] if not df.empty else None
-    if not latest:
+    with engine.begin() as conn:
+        val = conn.execute(text("select max(snapshot_date) from price_snapshots;")).scalar()
+    if not val:
         raise RuntimeError("No snapshots found. Run scripts/snapshot_prices.py first.")
-    return str(latest)
+    return str(val)
 
 
 def _snapshot_on_or_before(engine: Engine, target_date: str) -> str | None:
-    df = pd.read_sql_query(
-        """
-        SELECT MAX(snapshot_date) AS max_date
-        FROM price_snapshots
-        WHERE snapshot_date <= :target_date;
-        """,
-        engine,
-        params={"target_date": target_date},
-    )
-    val = df.iloc[0]["max_date"] if not df.empty else None
+    with engine.begin() as conn:
+        val = conn.execute(
+            text("select max(snapshot_date) from price_snapshots where snapshot_date <= :d;"),
+            {"d": target_date},
+        ).scalar()
     return str(val) if val else None
 
 
@@ -101,7 +94,7 @@ def _compute_live_owned(
     Uses disk cache for Scryfall payloads; does NOT touch DB.
     """
     unique = owned[["set_code", "collector_number"]].drop_duplicates()
-    card_cache: dict[PrintingKey, dict[str, Any]] = {}
+    card_cache: dict[PrintingKey, dict] = {}
 
     for _, r in unique.iterrows():
         key = PrintingKey(str(r["set_code"]), str(r["collector_number"]))
@@ -167,26 +160,33 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
     baseline: str | None = None
     baseline_rows = pd.DataFrame()
 
+    # A) Get latest snapshot (do NOT let baseline errors overwrite it)
     try:
         latest = _latest_snapshot_date(engine)
-        target = (date.fromisoformat(latest) - timedelta(days=days)).isoformat()
-        baseline = _snapshot_on_or_before(engine, target)
-
-        if baseline is not None:
-            baseline_rows = pd.read_sql_query(
-                """
-                SELECT scryfall_id, finish, usd AS usd_baseline
-                FROM price_snapshots
-                WHERE snapshot_date = :baseline;
-                """,
-                engine,
-                params={"baseline": baseline},
-            )
-    except Exception:
-        # No DB / no snapshots. Dashboard can still show live holdings; no history/movers.
+    except Exception as e:
+        print(f"[latest snapshot lookup failed] {type(e).__name__}: {e}")
         latest = None
-        baseline = None
-        baseline_rows = pd.DataFrame()
+
+    # B) Try baseline lookup only if latest exists
+    if latest is not None:
+        try:
+            target = (date.fromisoformat(latest) - timedelta(days=days)).isoformat()
+            baseline = _snapshot_on_or_before(engine, target)
+
+            if baseline is not None:
+                baseline_rows = pd.read_sql_query(
+                    """
+                    SELECT scryfall_id, finish, usd AS usd_baseline
+                    FROM price_snapshots
+                    WHERE snapshot_date = :baseline;
+                    """,
+                    engine,
+                    params={"baseline": baseline},
+                )
+        except Exception as e:
+            print(f"[baseline snapshot lookup failed] {type(e).__name__}: {e}")
+            baseline = None
+            baseline_rows = pd.DataFrame()
 
     # -------------------------
     # Holdings source: live vs snapshot
@@ -273,7 +273,9 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
 
         movers["delta_usd"] = movers["usd"] - movers["usd_baseline"]
         movers["pct_change"] = movers.apply(
-            lambda r: (r["delta_usd"] / r["usd_baseline"]) * 100.0 if r["usd_baseline"] not in (0, None) else None,
+            lambda r: (r["delta_usd"] / r["usd_baseline"]) * 100.0
+            if r["usd_baseline"] not in (0, None)
+            else None,
             axis=1,
         )
 
