@@ -4,10 +4,10 @@ import altair as alt
 from typing import Any, cast
 
 from scripts.snapshot_prices import ensure_today_snapshot
-try:
-    #ensure_today_snapshot()
-except Exception:
-    pass
+#try:
+#    ensure_today_snapshot()
+#except Exception:
+#    pass
 
 
 from scripts.dashboard_data import get_dashboard_data
