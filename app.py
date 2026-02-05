@@ -5,7 +5,7 @@ from typing import Any, cast
 
 from scripts.snapshot_prices import ensure_today_snapshot
 try:
-    ensure_today_snapshot()
+    #ensure_today_snapshot()
 except Exception:
     pass
 
