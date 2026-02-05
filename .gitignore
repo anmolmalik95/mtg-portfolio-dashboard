@@ -8,3 +8,9 @@ data/cache/
 
 .DS_Store
 .vscode/
+
+# sqlite
+*.sqlite
+*.db
+data/*.sqlite
+data/*.db
