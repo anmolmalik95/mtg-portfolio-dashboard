@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import sqlite3
+import os
 import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 from scripts._shared import (
     CACHE_TTL_HOURS,
@@ -17,21 +19,71 @@ from scripts._shared import (
 )
 
 # -------------------------
-# Snapshot helpers (SQLite)
+# DB helpers (Supabase in prod, SQLite locally)
 # -------------------------
-def _latest_snapshot_date(conn: sqlite3.Connection) -> str:
-    row = conn.execute("SELECT MAX(snapshot_date) FROM price_snapshots;").fetchone()
-    if not row or not row[0]:
+def _get_engine() -> Engine:
+    """
+    If DATABASE_URL is set (Streamlit Cloud), use Supabase Postgres.
+    Otherwise use local SQLite at data/mtg_prices.sqlite.
+    """
+    root = Path(__file__).resolve().parents[1]
+    db_path = root / "data" / "mtg_prices.sqlite"
+
+    db_url = os.getenv("DATABASE_URL")
+    if db_url:
+        return create_engine(db_url, pool_pre_ping=True)
+
+    # Local dev fallback
+    return create_engine(f"sqlite:///{db_path.as_posix()}", pool_pre_ping=True)
+
+
+def _ensure_schema(engine: Engine) -> None:
+    """
+    Ensure price_snapshots exists. Safe to run every startup.
+    Matches your existing SQLite schema exactly (types adapted for Postgres).
+    """
+    ddl = """
+    create table if not exists price_snapshots (
+        snapshot_date text not null,
+        scryfall_id text not null,
+        set_code text not null,
+        collector_number text not null,
+        finish text not null,
+        name text,
+        rarity text,
+        type_line text,
+        usd double precision,
+        fetched_at_epoch double precision,
+        primary key (snapshot_date, scryfall_id, finish)
+    );
+    """
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+
+
+# -------------------------
+# Snapshot helpers
+# -------------------------
+def _latest_snapshot_date(engine: Engine) -> str:
+    df = pd.read_sql_query("SELECT MAX(snapshot_date) AS max_date FROM price_snapshots;", engine)
+    latest = df.iloc[0]["max_date"] if not df.empty else None
+    if not latest:
         raise RuntimeError("No snapshots found. Run scripts/snapshot_prices.py first.")
-    return row[0]
+    return str(latest)
 
 
-def _snapshot_on_or_before(conn: sqlite3.Connection, target_date: str) -> str | None:
-    row = conn.execute(
-        "SELECT MAX(snapshot_date) FROM price_snapshots WHERE snapshot_date <= ?;",
-        (target_date,),
-    ).fetchone()
-    return row[0] if row and row[0] else None
+def _snapshot_on_or_before(engine: Engine, target_date: str) -> str | None:
+    df = pd.read_sql_query(
+        """
+        SELECT MAX(snapshot_date) AS max_date
+        FROM price_snapshots
+        WHERE snapshot_date <= :target_date;
+        """,
+        engine,
+        params={"target_date": target_date},
+    )
+    val = df.iloc[0]["max_date"] if not df.empty else None
+    return str(val) if val else None
 
 
 # -------------------------
@@ -46,9 +98,8 @@ def _compute_live_owned(
     owned: columns = set_code, collector_number, finish, qty
     Returns DataFrame with live-enriched columns:
       scryfall_id, name, rarity, type_line, usd, position_value_usd
-    Uses disk cache for Scryfall payloads; does NOT touch SQLite.
+    Uses disk cache for Scryfall payloads; does NOT touch DB.
     """
-    # fetch once per unique printing
     unique = owned[["set_code", "collector_number"]].drop_duplicates()
     card_cache: dict[PrintingKey, dict[str, Any]] = {}
 
@@ -95,53 +146,47 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
     days: lookback window for movers (uses latest snapshot date as 'today' for baseline selection)
     live_prices:
       - True  => totals/holdings/breakdowns computed using live Scryfall prices (cached), no persistence
-      - False => totals/holdings/breakdowns computed from latest SQLite snapshot
+      - False => totals/holdings/breakdowns computed from latest snapshot table
     """
     root = Path(__file__).resolve().parents[1]
     csv_path = root / "data" / "collection.csv"
-    db_path = root / "data" / "mtg_prices.sqlite"
     cache_dir = root / "data" / "cache" / "scryfall"
 
     df = load_collection(csv_path)
 
-    # Normalize keys
     owned = df[["set", "collector_number", "finish", "qty"]].copy()
     owned.rename(columns={"set": "set_code"}, inplace=True)
     owned["set_code"] = owned["set_code"].astype(str).str.strip().str.lower()
     owned["collector_number"] = owned["collector_number"].astype(str).str.strip()
     owned["finish"] = owned["finish"].astype(str).str.strip().str.lower()
 
-    # Defaults if DB not available / empty
+    engine = _get_engine()
+    _ensure_schema(engine)
+
     latest: str | None = None
     baseline: str | None = None
     baseline_rows = pd.DataFrame()
 
-    # Try to open DB (needed for baseline + history)
-    conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(db_path)
-        latest = _latest_snapshot_date(conn)
+        latest = _latest_snapshot_date(engine)
         target = (date.fromisoformat(latest) - timedelta(days=days)).isoformat()
-        baseline = _snapshot_on_or_before(conn, target)
+        baseline = _snapshot_on_or_before(engine, target)
 
         if baseline is not None:
             baseline_rows = pd.read_sql_query(
                 """
                 SELECT scryfall_id, finish, usd AS usd_baseline
                 FROM price_snapshots
-                WHERE snapshot_date = ?;
+                WHERE snapshot_date = :baseline;
                 """,
-                conn,
-                params=(baseline,),
+                engine,
+                params={"baseline": baseline},
             )
     except Exception:
         # No DB / no snapshots. Dashboard can still show live holdings; no history/movers.
         latest = None
         baseline = None
         baseline_rows = pd.DataFrame()
-    finally:
-        if conn is not None:
-            conn.close()
 
     # -------------------------
     # Holdings source: live vs snapshot
@@ -157,19 +202,15 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
                 "No snapshots found for snapshot-mode. Either run scripts/snapshot_prices.py or set live_prices=True."
             )
 
-        conn2 = sqlite3.connect(db_path)
-        try:
-            latest_rows = pd.read_sql_query(
-                """
-                SELECT set_code, collector_number, finish, scryfall_id, name, rarity, type_line, usd
-                FROM price_snapshots
-                WHERE snapshot_date = ?;
-                """,
-                conn2,
-                params=(latest,),
-            )
-        finally:
-            conn2.close()
+        latest_rows = pd.read_sql_query(
+            """
+            SELECT set_code, collector_number, finish, scryfall_id, name, rarity, type_line, usd
+            FROM price_snapshots
+            WHERE snapshot_date = :latest;
+            """,
+            engine,
+            params={"latest": latest},
+        )
 
         latest_owned = owned.merge(
             latest_rows, on=["set_code", "collector_number", "finish"], how="inner"
@@ -230,7 +271,6 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
         movers = latest_owned.merge(baseline_rows, on=["scryfall_id", "finish"], how="inner")
         movers = movers.dropna(subset=["usd", "usd_baseline"]).copy()
 
-        # avoid div-by-zero for pct change
         movers["delta_usd"] = movers["usd"] - movers["usd_baseline"]
         movers["pct_change"] = movers.apply(
             lambda r: (r["delta_usd"] / r["usd_baseline"]) * 100.0 if r["usd_baseline"] not in (0, None) else None,
@@ -266,7 +306,6 @@ def get_portfolio_timeseries() -> pd.DataFrame:
     """
     root = Path(__file__).resolve().parents[1]
     csv_path = root / "data" / "collection.csv"
-    db_path = root / "data" / "mtg_prices.sqlite"
 
     df = load_collection(csv_path)
 
@@ -276,18 +315,17 @@ def get_portfolio_timeseries() -> pd.DataFrame:
     owned["collector_number"] = owned["collector_number"].astype(str).str.strip()
     owned["finish"] = owned["finish"].astype(str).str.strip().str.lower()
 
-    conn = sqlite3.connect(db_path)
-    try:
-        snaps = pd.read_sql_query(
-            """
-            SELECT snapshot_date, set_code, collector_number, finish, usd
-            FROM price_snapshots
-            WHERE usd IS NOT NULL;
-            """,
-            conn,
-        )
-    finally:
-        conn.close()
+    engine = _get_engine()
+    _ensure_schema(engine)
+
+    snaps = pd.read_sql_query(
+        """
+        SELECT snapshot_date, set_code, collector_number, finish, usd
+        FROM price_snapshots
+        WHERE usd IS NOT NULL;
+        """,
+        engine,
+    )
 
     merged = owned.merge(
         snaps,
