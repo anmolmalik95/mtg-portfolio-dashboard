@@ -5,11 +5,6 @@ from typing import Any, cast
 
 from scripts.dashboard_data import get_dashboard_data
 
-import os
-import streamlit as st
-
-st.write("DATABASE_URL present:", bool(os.getenv("DATABASE_URL")))
-
 
 st.set_page_config(page_title="MTG Collection Dashboard", layout="wide")
 st.title("🧙‍♂️ Magic: The Gathering Collection Dashboard")
