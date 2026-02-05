@@ -3,11 +3,7 @@ import pandas as pd
 import altair as alt
 from typing import Any, cast
 
-import os
-
-import streamlit as st
-st.write("DB_URL_SET:", bool(os.getenv("DATABASE_URL")))
-
+from scripts.dashboard_data import get_dashboard_data
 
 st.set_page_config(page_title="MTG Collection Dashboard", layout="wide")
 st.title("🧙‍♂️ Magic: The Gathering Collection Dashboard")
