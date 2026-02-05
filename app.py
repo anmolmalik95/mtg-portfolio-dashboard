@@ -3,6 +3,49 @@ import pandas as pd
 import altair as alt
 from typing import Any, cast
 
+import os
+import streamlit as st
+from sqlalchemy import create_engine, text
+
+st.write("DB_URL_SET:", bool(os.getenv("DATABASE_URL")))
+
+db_url = os.getenv("DATABASE_URL")
+if db_url:
+    engine = create_engine(db_url, pool_pre_ping=True)
+
+    try:
+        with engine.begin() as conn:
+            # 1) what DB/schema am I actually connected to?
+            db_name = conn.execute(text("select current_database();")).scalar()
+            schema = conn.execute(text("select current_schema();")).scalar()
+            st.write("Connected DB:", db_name)
+            st.write("Schema:", schema)
+
+            # 2) does the table exist?
+            exists = conn.execute(text("""
+                select exists(
+                    select 1
+                    from information_schema.tables
+                    where table_schema = current_schema()
+                      and table_name = 'price_snapshots'
+                );
+            """)).scalar()
+            st.write("price_snapshots exists:", bool(exists))
+
+            # 3) how many rows / max snapshot date?
+            if exists:
+                rowcount = conn.execute(text("select count(*) from price_snapshots;")).scalar()
+                max_date = conn.execute(text("select max(snapshot_date) from price_snapshots;")).scalar()
+                st.write("price_snapshots rowcount:", rowcount)
+                st.write("max(snapshot_date):", max_date)
+
+    except Exception as e:
+        st.error(f"DB debug failed: {type(e).__name__}: {e}")
+else:
+    st.warning("DATABASE_URL not set, using SQLite fallback")
+
+
+
 from scripts.snapshot_prices import ensure_today_snapshot
 
 @st.cache_data(ttl=60 * 60)  # cache 1 hour so reruns don't re-trigger snapshot
