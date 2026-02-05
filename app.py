@@ -4,6 +4,19 @@ import altair as alt
 from typing import Any, cast
 
 from scripts.snapshot_prices import ensure_today_snapshot
+
+@st.cache_data(ttl=60 * 60)  # cache 1 hour so reruns don't re-trigger snapshot
+def _maybe_snapshot_today() -> bool:
+    return ensure_today_snapshot()
+
+# Call once (per hour) per app instance
+try:
+    created = _maybe_snapshot_today()
+    # optional: st.caption(f"Snapshot today created: {created}")
+except Exception as e:
+    # Don't crash the app just because snapshot failed
+    st.warning(f"Snapshot creation skipped (will retry later): {e}")
+
 # try:
 #     ensure_today_snapshot()
 # except Exception:

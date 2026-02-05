@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+import time
 
 from scripts._shared import (
     PrintingKey,
@@ -130,6 +131,8 @@ def run_snapshot(engine: Engine | None = None, snapshot_date: str | None = None)
 
     # Snapshot per *finish* present in your collection rows
     for _, row in df[["set", "collector_number", "finish"]].drop_duplicates().iterrows():
+        time.sleep(0.12)
+
         key = PrintingKey(row["set"], row["collector_number"])
         card, _note = fetch_scryfall_card_cached(cache_dir, key, ttl_hours=CACHE_TTL_HOURS)
         usd, _price_note = choose_unit_price_usd(card, row["finish"])
