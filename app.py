@@ -33,7 +33,7 @@ chart_granularity = st.sidebar.selectbox(
 # Load data
 # -------------------------
 with st.spinner("Loading portfolio data..."):
-    data = cast(dict[str, Any], get_dashboard_data(days=days, top_n=top_n, live_prices=False))
+    data = cast(dict[str, Any], get_dashboard_data(days=days, top_n=top_n, live_prices=True))
 
 latest_snapshot = cast(str, data["latest_snapshot"])
 baseline_snapshot = cast(str | None, data["baseline_snapshot"])
