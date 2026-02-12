@@ -14,3 +14,16 @@ data/cache/
 *.db
 data/*.sqlite
 data/*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtualenv
+.venv/
+
+# Local DB / cache / demo artifacts
+data/mtg_prices.sqlite
+data/cache/
+data/demo_backups/
