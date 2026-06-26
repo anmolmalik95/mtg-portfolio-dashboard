@@ -51,6 +51,8 @@ with st.spinner("Loading portfolio data..."):
 
 
 latest_snapshot = cast(str, data["latest_snapshot"])
+valuation_snapshot = cast(str, data["valuation_snapshot"])
+prices_stale = bool(data["prices_stale"])
 baseline_snapshot = cast(str | None, data["baseline_snapshot"])
 total_value_usd = float(cast(float, data["total_value_usd"]))
 num_positions = int(cast(int, data["num_positions"]))
@@ -70,8 +72,16 @@ c1.metric("Total Collection Value (USD)", f"${total_value_usd:,.2f}")
 c2.metric("Positions Tracked", num_positions)
 c3.metric("Latest Snapshot Date", latest_snapshot)
 
+if prices_stale:
+    st.warning(
+        f"⚠️ The latest snapshot ({latest_snapshot}) has no usable prices yet "
+        f"(today's price fetch likely failed). Showing values as of the last "
+        f"fully-priced snapshot: {valuation_snapshot}."
+    )
+
 st.caption(
     f"Latest snapshot: {latest_snapshot} | "
+    f"Valuation as of: {valuation_snapshot} | "
     f"Baseline (for movers): {baseline_snapshot or 'N/A'} | "
     f"Window: {days} day(s)"
 )

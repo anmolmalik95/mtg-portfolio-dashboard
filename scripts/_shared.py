@@ -131,8 +131,13 @@ def fetch_scryfall_card_cached(cache_dir: Path, key: PrintingKey, ttl_hours: int
         return cached, "cache_hit"
 
     card = fetch_scryfall_card(key.set_code, key.collector_number)
-    cache_set(cache_dir, key, card)
-    return card, "cache_miss_fetched"
+    # Never cache failure stubs (id starts with "unfetched:"). Caching them would
+    # poison the cache for CACHE_TTL_HOURS and make a transient Scryfall outage /
+    # rate-limit "stick", so even retries keep returning price-less stubs.
+    if not str(card.get("id", "")).startswith("unfetched:"):
+        cache_set(cache_dir, key, card)
+        return card, "cache_miss_fetched"
+    return card, "cache_miss_unfetched"
 
 
 def choose_unit_price_usd(card: Dict[str, Any], finish: str) -> Tuple[Optional[float], str]:

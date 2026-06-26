@@ -69,6 +69,23 @@ def _latest_snapshot_date(engine: Engine) -> str:
     return str(latest)
 
 
+def _latest_priced_snapshot_date(engine: Engine) -> str | None:
+    """Latest snapshot date that has at least one non-null usd price.
+
+    Used so the KPI/holdings fall back to the last usable snapshot when today's
+    run failed to fetch prices (all-NULL), instead of reporting $0.00.
+    """
+    df = pd.read_sql_query(
+        text(
+            "SELECT MAX(snapshot_date) AS max_date "
+            "FROM price_snapshots WHERE usd IS NOT NULL;"
+        ),
+        engine,
+    )
+    val = df.iloc[0]["max_date"] if not df.empty else None
+    return str(val) if val else None
+
+
 def _snapshot_on_or_before(engine: Engine, target_date: str) -> str | None:
     df = pd.read_sql_query(
         text(
@@ -149,12 +166,17 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
     _ensure_schema(engine)
 
     latest: str | None = None
+    valuation: str | None = None
     baseline: str | None = None
     baseline_rows = pd.DataFrame()
 
     try:
         latest = _latest_snapshot_date(engine)
-        target = (date.fromisoformat(latest) - timedelta(days=days)).isoformat()
+        # Value the portfolio off the latest *priced* snapshot. If today's run
+        # failed (all-NULL prices), this falls back to the last usable day so the
+        # KPIs don't collapse to $0.00 / empty while the chart shows real value.
+        valuation = _latest_priced_snapshot_date(engine) or latest
+        target = (date.fromisoformat(valuation) - timedelta(days=days)).isoformat()
         baseline = _snapshot_on_or_before(engine, target)
 
         if baseline is not None:
@@ -172,11 +194,12 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
     except Exception as e:
         print(f"[snapshot lookup failed] {type(e).__name__}: {e}")
         latest = None
+        valuation = None
         baseline = None
         baseline_rows = pd.DataFrame()
 
     pricing_mode = "live" if live_prices else "snapshot"
-    pricing_asof = date.today().isoformat() if live_prices else (latest or "N/A")
+    pricing_asof = date.today().isoformat() if live_prices else (valuation or "N/A")
 
     if live_prices:
         latest_owned = _compute_live_owned(owned, cache_dir=cache_dir, ttl_hours=CACHE_TTL_HOURS)
@@ -191,11 +214,11 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
                 """
                 SELECT set_code, collector_number, finish, scryfall_id, name, rarity, type_line, usd
                 FROM price_snapshots
-                WHERE snapshot_date = :latest;
+                WHERE snapshot_date = :valuation;
                 """
             ),
             engine,
-            params={"latest": latest},
+            params={"valuation": valuation},
         )
 
         latest_owned = owned.merge(latest_rows, on=["set_code", "collector_number", "finish"], how="inner")
@@ -257,6 +280,8 @@ def get_dashboard_data(days: int = 7, top_n: int = 5, live_prices: bool = True) 
         "pricing_mode": pricing_mode,
         "pricing_asof": pricing_asof,
         "latest_snapshot": latest or "N/A",
+        "valuation_snapshot": valuation or "N/A",
+        "prices_stale": bool(valuation and latest and valuation != latest),
         "baseline_snapshot": baseline,
         "total_value_usd": total_value,
         "num_positions": num_positions,

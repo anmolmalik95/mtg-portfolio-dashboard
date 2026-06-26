@@ -112,6 +112,35 @@ def upsert_snapshot(
         conn.execute(text(sql), payload)
 
 
+# A snapshot whose priced fraction is below this is treated as a *failed* run
+# (e.g. Scryfall rate-limited the whole batch) and will be retried, not kept.
+MIN_PRICED_FRACTION = 0.5
+
+
+def snapshot_priced_fraction(engine: Engine, snapshot_date: str) -> tuple[int, int]:
+    """Return (total_rows, priced_rows) for the given snapshot date."""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                "select count(*) as total, count(usd) as priced "
+                "from price_snapshots where snapshot_date = :d;"
+            ),
+            {"d": snapshot_date},
+        ).fetchone()
+    total = int(row[0] or 0)
+    priced = int(row[1] or 0)
+    return total, priced
+
+
+def snapshot_is_healthy(
+    engine: Engine, snapshot_date: str, min_fraction: float = MIN_PRICED_FRACTION
+) -> bool:
+    total, priced = snapshot_priced_fraction(engine, snapshot_date)
+    if total == 0:
+        return False
+    return (priced / total) >= min_fraction
+
+
 def run_snapshot(engine: Engine | None = None, snapshot_date: str | None = None) -> str:
     """
     Writes snapshot rows for the given date (default: today).
@@ -147,7 +176,14 @@ def run_snapshot(engine: Engine | None = None, snapshot_date: str | None = None)
             usd=usd,
         )
 
-    print(f"✅ Snapshot saved for {snap_date}")
+    total, priced = snapshot_priced_fraction(engine, snap_date)
+    pct = (priced / total * 100.0) if total else 0.0
+    print(f"✅ Snapshot saved for {snap_date} — {priced}/{total} rows priced ({pct:.0f}%)")
+    if total and not snapshot_is_healthy(engine, snap_date):
+        print(
+            f"⚠️ Snapshot {snap_date} looks unhealthy (only {pct:.0f}% priced); "
+            "it will be retried on the next run."
+        )
     return snap_date
 
 
@@ -160,13 +196,11 @@ def ensure_today_snapshot(engine: Engine | None = None) -> bool:
     ensure_schema(engine)
 
     today = date.today().isoformat()
-    with engine.begin() as conn:
-        exists = conn.execute(
-            text("select 1 from price_snapshots where snapshot_date = :d limit 1;"),
-            {"d": today},
-        ).fetchone()
 
-    if exists:
+    # Re-run when today's snapshot is missing OR unhealthy (e.g. a previous run
+    # was rate-limited and wrote mostly NULL prices). run_snapshot upserts, so a
+    # retry overwrites the bad rows once Scryfall is reachable again.
+    if snapshot_is_healthy(engine, today):
         return False
 
     run_snapshot(engine=engine, snapshot_date=today)
